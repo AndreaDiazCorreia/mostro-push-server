@@ -234,15 +234,44 @@ cargo clippy
 cargo fmt
 ```
 
-## TODO
+## Testing
 
-- [ ] Implement OAuth2 token refresh for FCM
-- [ ] Add database for persistent endpoint storage
-- [ ] Implement retry logic for failed deliveries
+A test script is provided to verify all endpoints:
+
+```bash
+# Start the server
+RUST_LOG=info cargo run
+
+# In another terminal, run tests
+./test_server.sh
+```
+
+The test script will:
+1. Check health endpoint
+2. Verify status endpoint
+3. Register a test UnifiedPush endpoint
+4. Verify persistence (check data/unifiedpush_endpoints.json)
+5. Unregister the endpoint
+6. Test the notification system
+
+## Implementation Status
+
+### ✅ Completed
+- [x] Nostr listener with Mostro pubkey filtering (Option B: Silent Push Global)
+- [x] UnifiedPush endpoint registration/unregistration
+- [x] Persistent storage for UnifiedPush endpoints (JSON file)
+- [x] FCM OAuth2 token refresh with JWT signing
+- [x] Intelligent notification batching (5s delay, 60s cooldown)
+- [x] HTTP API for endpoint management
+- [x] Automatic relay reconnection
+
+### 🔄 TODO
+- [ ] Implement retry logic for failed push deliveries
 - [ ] Add metrics and monitoring (Prometheus)
 - [ ] Implement authentication for API endpoints
 - [ ] Support for multiple Mostro instances
-- [ ] Integration tests with mock relay
+- [ ] Integration tests with mock Nostr relay
+- [ ] Docker deployment configuration
 
 ## License
 
