@@ -1,16 +1,61 @@
 # Mostro Push Backend
 
-Independent Rust backend to support push notifications via UnifiedPush and Firebase Cloud Messaging (FCM), compatible with GrapheneOS users and other systems without Google Play Services.
+Privacy-preserving push notification server for Mostro P2P trades. Inspired by [MIP-05](https://github.com/marmot-chat/mips), this server enables targeted push notifications without exposing user data to Firebase/Apple.
+
+## How It Works
+
+```
+┌─────────────────┐     1. Register token      ┌──────────────────┐
+│  Mostro Mobile  │ ─────────────────────────► │  Push Server     │
+│                 │     (encrypted)            │                  │
+│  trade_pubkey   │                            │  Stores:         │
+│  + FCM token    │                            │  trade_pubkey →  │
+└─────────────────┘                            │  device_token    │
+                                               └────────┬─────────┘
+                                                        │
+┌─────────────────┐     2. Publishes event     ┌────────▼─────────┐
+│  Mostro Daemon  │ ─────────────────────────► │  Nostr Relay     │
+│                 │     kind 1059              │                  │
+│  (no changes    │     p: trade_pubkey        │                  │
+│   required)     │                            └────────┬─────────┘
+└─────────────────┘                                     │
+                                                        │ 3. Server observes
+                                               ┌────────▼─────────┐
+                                               │  Push Server     │
+                                               │                  │
+                                               │  Extracts p tag  │
+                                               │  Looks up token  │
+                                               │  Sends push      │
+                                               └────────┬─────────┘
+                                                        │
+                                               ┌────────▼─────────┐
+                                               │  FCM / APNs      │
+                                               │  (silent push)   │
+                                               └────────┬─────────┘
+                                                        │
+                                               ┌────────▼─────────┐
+                                               │  Mostro Mobile   │
+                                               │  wakes up,       │
+                                               │  fetches events  │
+                                               └──────────────────┘
+```
+
+## Privacy Properties
+
+- **Server knows**: Temporary mapping of `trade_pubkey` → `device_token`, timing of events
+- **Server does NOT know**: User identity (npub), message content, which orders belong to whom
+- **Firebase/Apple know**: A notification occurred (unavoidable with push)
+- **Firebase/Apple do NOT know**: Nostr identity, trade details, message content
 
 ## Features
 
-- Listens to kind 1059 events on Nostr relays
+- **Targeted notifications**: Only the recipient device receives the push (not broadcast)
+- **Encrypted token registration**: Device tokens are encrypted with server's public key
+- **Privacy-first**: No persistent storage, tokens auto-expire
 - Firebase Cloud Messaging (FCM) support
 - UnifiedPush support (GrapheneOS, LineageOS)
-- Intelligent notification batching
-- Rate limiting and cooldown
 - Automatic relay reconnection
-- HTTP API for endpoint management
+- HTTP API for token management
 
 ## Requirements
 
@@ -86,6 +131,23 @@ Response:
 {"status":"ok"}
 ```
 
+### Server Info
+
+Get the server's public key (needed by clients to encrypt tokens):
+
+```bash
+curl http://localhost:8080/api/info
+```
+
+Response:
+```json
+{
+  "server_pubkey": "02abc123...",
+  "version": "0.2.0",
+  "encrypted_token_size": 281
+}
+```
+
 ### Status
 
 ```bash
@@ -96,36 +158,46 @@ Response:
 ```json
 {
   "status": "running",
-  "version": "0.1.0"
+  "version": "0.2.0",
+  "server_pubkey": "02abc123...",
+  "tokens": {
+    "total": 42,
+    "android": 35,
+    "ios": 7
+  }
 }
 ```
 
-### Register UnifiedPush Endpoint
+### Register Token
+
+Register an encrypted device token for a trade. The client must encrypt the token using the server's public key.
 
 ```bash
 curl -X POST http://localhost:8080/api/register \
   -H "Content-Type: application/json" \
   -d '{
-    "device_id": "my-device-123",
-    "endpoint_url": "https://push.example.com/endpoint"
+    "trade_pubkey": "abc123...def456",
+    "encrypted_token": "<base64-encoded-encrypted-token>"
   }'
 ```
 
-### Unregister Endpoint
+Response:
+```json
+{
+  "success": true,
+  "message": "Token registered successfully",
+  "platform": "android"
+}
+```
+
+### Unregister Token
 
 ```bash
 curl -X POST http://localhost:8080/api/unregister \
   -H "Content-Type: application/json" \
   -d '{
-    "device_id": "my-device-123",
-    "endpoint_url": "https://push.example.com/endpoint"
+    "trade_pubkey": "abc123...def456"
   }'
-```
-
-### Send Test Notification
-
-```bash
-curl -X POST http://localhost:8080/api/test
 ```
 
 ## Architecture

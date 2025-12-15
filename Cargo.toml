@@ -1,6 +1,6 @@
 [package]
 name = "mostro-push-backend"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -40,12 +40,17 @@ chrono = { version = "0.4", features = ["serde"] }
 # Rate limiting
 governor = "0.6"
 
-# Hex encoding/decoding
+# Cryptography for token encryption (MIP-05 style)
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+secp256k1 = { version = "0.28", features = ["rand-std"] }
+rand = "0.8"
 hex = "0.4"
+base64 = "0.21"
 
-# JWT for Google OAuth
-jsonwebtoken = "9.2"
-base64 = "0.22"
+# JWT for Firebase service account authentication
+jsonwebtoken = "9"
 
 [dev-dependencies]
 mockito = "1.2"
