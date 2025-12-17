@@ -1,25 +1,23 @@
 use async_trait::async_trait;
-use log::{info, error, warn};
+use log::{info, error, debug, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use jsonwebtoken::{encode, EncodingKey, Header, Algorithm};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
-use tokio::fs;
 
 use crate::config::Config;
+use crate::crypto::Platform;
 use super::PushService;
 
 #[derive(Debug, Deserialize)]
 struct ServiceAccount {
-    #[serde(rename = "type")]
-    account_type: String,
-    project_id: String,
-    private_key: String,
     client_email: String,
-    token_uri: String,
+    private_key: String,
+    project_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,8 +25,8 @@ struct Claims {
     iss: String,
     scope: String,
     aud: String,
-    exp: u64,
     iat: u64,
+    exp: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,122 +35,142 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-#[derive(Clone)]
 struct CachedToken {
     token: String,
     expires_at: u64,
 }
 
 pub struct FcmPush {
-    config: Config,
     client: Client,
-    service_account: Arc<Mutex<Option<ServiceAccount>>>,
-    cached_token: Arc<Mutex<Option<CachedToken>>>,
-    firebase_project_id: String,
+    service_account: Option<ServiceAccount>,
+    cached_token: Arc<RwLock<Option<CachedToken>>>,
+    project_id: String,
 }
 
 impl FcmPush {
     pub fn new(config: Config) -> Self {
-        // Get Firebase project ID from environment
-        let firebase_project_id = std::env::var("FIREBASE_PROJECT_ID")
-            .unwrap_or_else(|_| "mostro-test".to_string());
+        let service_account_path = std::env::var("FIREBASE_SERVICE_ACCOUNT_PATH").ok();
+        let project_id = std::env::var("FIREBASE_PROJECT_ID")
+            .unwrap_or_else(|_| "mostro".to_string());
+        
+        let service_account = service_account_path.and_then(|path| {
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    match serde_json::from_str::<ServiceAccount>(&content) {
+                        Ok(sa) => {
+                            info!("Loaded Firebase service account for {}", sa.client_email);
+                            Some(sa)
+                        }
+                        Err(e) => {
+                            error!("Failed to parse service account JSON: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Could not read service account file {}: {}", path, e);
+                    None
+                }
+            }
+        });
 
         Self {
-            config,
             client: Client::new(),
-            service_account: Arc::new(Mutex::new(None)),
-            cached_token: Arc::new(Mutex::new(None)),
-            firebase_project_id,
+            service_account,
+            cached_token: Arc::new(RwLock::new(None)),
+            project_id,
         }
     }
 
-    /// Initialize by loading service account from file
-    pub async fn init(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Initializing FCM authentication...");
-
-        let path = std::env::var("FIREBASE_SERVICE_ACCOUNT_PATH")?;
-        info!("Loading service account from: {}", path);
-
-        let content = fs::read_to_string(&path).await?;
-        let account: ServiceAccount = serde_json::from_str(&content)?;
-
-        let mut service_account = self.service_account.lock().await;
-        *service_account = Some(account);
-
-        info!("FCM authentication initialized successfully");
-        Ok(())
-    }
-
-    /// Get a valid OAuth2 access token (handles refresh automatically)
-    async fn get_access_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        // Check if we have a valid cached token
+    async fn get_access_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // Check cached token
         {
-            let cached = self.cached_token.lock().await;
-            if let Some(token) = cached.as_ref() {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                // Return cached token if it's still valid (with 5 minute buffer)
-                if token.expires_at > now + 300 {
-                    return Ok(token.token.clone());
+            let cache = self.cached_token.read().await;
+            if let Some(ref cached) = *cache {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)?
+                    .as_secs();
+                // Refresh 60 seconds before expiry
+                if cached.expires_at > now + 60 {
+                    return Ok(cached.token.clone());
                 }
             }
         }
 
-        // Need to fetch new token
-        info!("Fetching new FCM access token...");
-        let new_token = self.fetch_new_token().await?;
+        // Need to refresh token
+        let sa = self.service_account.as_ref()
+            .ok_or("No service account configured")?;
 
-        // Cache the token
-        {
-            let mut cached = self.cached_token.lock().await;
-            *cached = Some(new_token.clone());
-        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
 
-        Ok(new_token.token)
-    }
-
-    /// Fetch a new access token from Google OAuth
-    async fn fetch_new_token(&self) -> Result<CachedToken, Box<dyn std::error::Error>> {
-        let account = self.service_account.lock().await;
-        let account = account.as_ref()
-            .ok_or("Service account not loaded. Call init() first.")?;
-
-        // Create JWT claims
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let claims = Claims {
-            iss: account.client_email.clone(),
+            iss: sa.client_email.clone(),
             scope: "https://www.googleapis.com/auth/firebase.messaging".to_string(),
-            aud: account.token_uri.clone(),
-            exp: now + 3600, // 1 hour
+            aud: "https://oauth2.googleapis.com/token".to_string(),
             iat: now,
+            exp: now + 3600, // 1 hour
         };
 
-        // Encode JWT
         let header = Header::new(Algorithm::RS256);
-        let encoding_key = EncodingKey::from_rsa_pem(account.private_key.as_bytes())?;
-        let jwt = encode(&header, &claims, &encoding_key)?;
+        let key = EncodingKey::from_rsa_pem(sa.private_key.as_bytes())?;
+        let jwt = encode(&header, &claims, &key)?;
 
         // Exchange JWT for access token
-        let params = [
-            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-            ("assertion", &jwt),
-        ];
-
         let response = self.client
-            .post(&account.token_uri)
-            .form(&params)
+            .post("https://oauth2.googleapis.com/token")
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", &jwt),
+            ])
             .send()
             .await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(format!("Token exchange failed: {}", error_text).into());
+            return Err(format!("OAuth2 token exchange failed: {}", error_text).into());
         }
 
         let token_response: TokenResponse = response.json().await?;
+        
+        // Cache the token
+        {
+            let mut cache = self.cached_token.write().await;
+            *cache = Some(CachedToken {
+                token: token_response.access_token.clone(),
+                expires_at: now + token_response.expires_in,
+            });
+        }
 
-        Ok(CachedToken {
-            token: token_response.access_token,
-            expires_at: now + token_response.expires_in,
+        info!("Obtained new FCM access token, expires in {}s", token_response.expires_in);
+        Ok(token_response.access_token)
+    }
+
+    fn build_silent_payload_for_token(device_token: &str) -> serde_json::Value {
+        json!({
+            "message": {
+                "token": device_token,
+                "data": {
+                    "type": "silent_wake",
+                    "source": "mostro-push-server",
+                    "timestamp": chrono::Utc::now().timestamp().to_string()
+                },
+                "android": {
+                    "priority": "high"
+                },
+                "apns": {
+                    "headers": {
+                        "apns-priority": "10",
+                        "apns-push-type": "background"
+                    },
+                    "payload": {
+                        "aps": {
+                            "content-available": 1
+                        }
+                    }
+                }
+            }
         })
     }
 }
@@ -160,17 +178,12 @@ impl FcmPush {
 #[async_trait]
 impl PushService for FcmPush {
     async fn send_silent_push(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Skip if FCM is not initialized (optional service)
-        if self.service_account.lock().await.is_none() {
-            warn!("FCM service account not loaded, skipping FCM push");
-            return Ok(());
-        }
-
-        let token = self.get_access_token().await?;
+        let token = self.get_access_token().await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
         let fcm_url = format!(
             "https://fcm.googleapis.com/v1/projects/{}/messages:send",
-            self.firebase_project_id
+            self.project_id
         );
 
         let payload = json!({
@@ -204,11 +217,49 @@ impl PushService for FcmPush {
             .await?;
 
         if response.status().is_success() {
-            info!("FCM notification sent successfully");
+            info!("FCM topic notification sent successfully");
             Ok(())
         } else {
             error!("FCM error: {}", response.text().await?);
             Err("FCM send failed".into())
         }
+    }
+
+    async fn send_to_token(
+        &self,
+        device_token: &str,
+        platform: &Platform,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let auth_token = self.get_access_token().await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+        let fcm_url = format!(
+            "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+            self.project_id
+        );
+
+        let payload = Self::build_silent_payload_for_token(device_token);
+
+        debug!("Sending FCM to token: {}...", &device_token[..20.min(device_token.len())]);
+
+        let response = self.client
+            .post(&fcm_url)
+            .bearer_auth(&auth_token)
+            .json(&payload)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            info!("FCM notification sent to {} device", platform);
+            Ok(())
+        } else {
+            let error_text = response.text().await?;
+            error!("FCM error for {} device: {}", platform, error_text);
+            Err(format!("FCM send failed: {}", error_text).into())
+        }
+    }
+
+    fn supports_platform(&self, platform: &Platform) -> bool {
+        matches!(platform, Platform::Android | Platform::Ios)
     }
 }
