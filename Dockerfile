@@ -1,4 +1,4 @@
-FROM rust:1.75 as builder
+FROM rust:1.83 as builder
 
 WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock ./
@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/app/target/release/mostro-push-backend /usr/local/bin/
+COPY secrets/ /secrets/
 
 ENV RUST_LOG=info
 
