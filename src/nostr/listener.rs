@@ -1,33 +1,42 @@
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use nostr_sdk::prelude::*;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 use crate::config::Config;
 use crate::push::PushService;
-use crate::utils::batching::BatchingManager;
+use crate::store::TokenStore;
 
 pub struct NostrListener {
     config: Config,
     push_services: Arc<Mutex<Vec<Box<dyn PushService>>>>,
-    batching_manager: Arc<Mutex<BatchingManager>>,
+    token_store: Arc<TokenStore>,
+    mostro_pubkey: String,
 }
 
 impl NostrListener {
     pub fn new(
         config: Config,
         push_services: Arc<Mutex<Vec<Box<dyn PushService>>>>,
-    ) -> Self {
-        let batching_manager = Arc::new(Mutex::new(
-            BatchingManager::new(config.push.batch_delay_ms)
-        ));
-
-        Self {
+        token_store: Arc<TokenStore>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Validate the pubkey format
+        let mostro_pubkey = config.nostr.mostro_pubkey.clone();
+        if mostro_pubkey.len() != 64 {
+            return Err("Invalid MOSTRO_PUBKEY format (expected 64 hex characters)".into());
+        }
+        // Validate it's valid hex by trying to parse it
+        XOnlyPublicKey::from_str(&mostro_pubkey)
+            .map_err(|_| "Invalid MOSTRO_PUBKEY (not a valid public key)")?;
+        
+        Ok(Self {
             config,
             push_services,
-            batching_manager,
-        }
+            token_store,
+            mostro_pubkey,
+        })
     }
 
     pub async fn start(&self) {
@@ -61,13 +70,10 @@ impl NostrListener {
         // Connect to all relays
         client.connect().await;
 
-        // Create filter for kind 1059 events from Mostro instance
-        // Filter by author (Mostro pubkey) to only get events FROM this Mostro instance
-        // This implements Option B: Silent Push Global approach
-        let since = Timestamp::now() - Duration::from_secs(300);
-        let pubkey_bytes = ::hex::decode(&self.config.nostr.mostro_pubkey)?;
-        let mostro_pubkey = XOnlyPublicKey::from_slice(&pubkey_bytes)?;
-
+        // Create filter for kind 1059 events from Mostro
+        let since = Timestamp::now() - Duration::from_secs(60);
+        let mostro_pubkey = XOnlyPublicKey::from_str(&self.mostro_pubkey)
+            .map_err(|e| format!("Invalid mostro pubkey: {}", e))?;
         let filter = Filter::new()
             .kinds(vec![Kind::Custom(1059)])
             .author(mostro_pubkey)
@@ -75,33 +81,63 @@ impl NostrListener {
 
         // Subscribe to events
         client.subscribe(vec![filter]).await;
-        info!(
-            "Subscribed to kind 1059 events from Mostro instance: {}",
-            &self.config.nostr.mostro_pubkey[..16]
-        );
+        info!("Subscribed to kind 1059 events from Mostro: {}", self.config.nostr.mostro_pubkey);
 
         // Handle incoming events
-        let batching_manager = self.batching_manager.clone();
+        let token_store = self.token_store.clone();
         let push_services = self.push_services.clone();
 
         client
             .handle_notifications(|notification| async {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::Custom(1059) {
-                        info!("Received kind 1059 event: {}", event.id);
+                        debug!("Received kind 1059 event: {}", event.id);
 
-                        // Trigger batched notification
-                        let mut manager = batching_manager.lock().await;
-                        if manager.should_send().await {
-                            drop(manager);
-
-                            // Send notifications through all push services
-                            let services = push_services.lock().await;
-                            for service in services.iter() {
-                                if let Err(e) = service.send_silent_push().await {
-                                    error!("Failed to send push notification: {}", e);
+                        // Extract recipient from 'p' tag
+                        let recipient_pubkey = event.tags.iter()
+                            .find_map(|tag| {
+                                let tag_vec = tag.as_vec();
+                                if tag_vec.len() >= 2 && tag_vec[0] == "p" {
+                                    Some(tag_vec[1].clone())
+                                } else {
+                                    None
                                 }
+                            });
+
+                        if let Some(trade_pubkey) = recipient_pubkey {
+                            debug!("Event recipient: {}...", &trade_pubkey[..16]);
+
+                            // Look up token in store
+                            if let Some(registered_token) = token_store.get(&trade_pubkey).await {
+                                info!(
+                                    "Found registered token for {}..., sending push to {} device",
+                                    &trade_pubkey[..16],
+                                    registered_token.platform
+                                );
+
+                                // Send push notification to the specific device
+                                let services = push_services.lock().await;
+                                for service in services.iter() {
+                                    if service.supports_platform(&registered_token.platform) {
+                                        match service.send_to_token(
+                                            &registered_token.device_token,
+                                            &registered_token.platform,
+                                        ).await {
+                                            Ok(_) => {
+                                                info!("Push sent successfully for event {}", event.id);
+                                                break; // Only need one service to succeed
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to send push: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                debug!("No registered token for {}...", &trade_pubkey[..16]);
                             }
+                        } else {
+                            debug!("No 'p' tag found in event {}", event.id);
                         }
                     }
                 }
